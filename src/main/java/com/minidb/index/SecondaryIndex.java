@@ -23,14 +23,44 @@ public class SecondaryIndex {
     private boolean isUnique;                      // 是否唯一索引
     private long createTime;                       // 创建时间
 
-    // 索引数据存储：使用TreeMap实现有序存储
-    // key: SecondaryIndexEntry (包含索引值和主键)
-    // value: 该索引值对应的主键列表（非唯一索引可能有多个）
-    private TreeMap<SecondaryIndexEntry, List<Integer>> indexData;
+    // 索引数据存储：内存版 B+ 树（键为 SecondaryIndexEntry）
+    private SecondaryIndexBPlusTree indexData;
+
+    // 统计用：索引值（不含主键）出现次数
+    private Map<IndexValuesKey, Integer> valueFrequencies;
 
     // 统计信息
     private IndexStatistics statistics;
     private final ReentrantReadWriteLock indexLock;
+
+    private static final class IndexValuesKey {
+        private final List<Comparable<?>> values;
+
+        private IndexValuesKey(List<Comparable<?>> values) {
+            this.values = new ArrayList<>(values);
+        }
+
+        private static IndexValuesKey from(SecondaryIndexEntry entry) {
+            return new IndexValuesKey(entry.getIndexValues());
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) {
+                return true;
+            }
+            if (!(obj instanceof IndexValuesKey)) {
+                return false;
+            }
+            IndexValuesKey other = (IndexValuesKey) obj;
+            return values.equals(other.values);
+        }
+
+        @Override
+        public int hashCode() {
+            return values.hashCode();
+        }
+    }
 
     /**
      * 构造单列索引
@@ -45,7 +75,8 @@ public class SecondaryIndex {
         this.columnTypes.add(columnType);
         this.isUnique = isUnique;
         this.createTime = System.currentTimeMillis();
-        this.indexData = new TreeMap<>();
+        this.indexData = new SecondaryIndexBPlusTree();
+        this.valueFrequencies = new HashMap<>();
         this.statistics = new IndexStatistics();
         this.indexLock = new ReentrantReadWriteLock();
     }
@@ -61,7 +92,8 @@ public class SecondaryIndex {
         this.columnTypes = new ArrayList<>(columnTypes);
         this.isUnique = isUnique;
         this.createTime = System.currentTimeMillis();
-        this.indexData = new TreeMap<>();
+        this.indexData = new SecondaryIndexBPlusTree();
+        this.valueFrequencies = new HashMap<>();
         this.statistics = new IndexStatistics();
         this.indexLock = new ReentrantReadWriteLock();
     }
@@ -72,20 +104,12 @@ public class SecondaryIndex {
     public void insert(SecondaryIndexEntry entry) {
         indexLock.writeLock().lock();
         try {
-            List<Integer> pkList = indexData.get(entry);
-
-            if (pkList == null) {
-                // 新的索引值
-                pkList = new ArrayList<>();
-                pkList.add(entry.getPrimaryKey());
-                indexData.put(entry, pkList);
-                statistics.incrementKey(true);  // 新的不同键
-            } else {
-                // 已存在的索引值
-                if (!pkList.contains(entry.getPrimaryKey())) {
-                    pkList.add(entry.getPrimaryKey());
-                    statistics.incrementKey(false);  // 不是新的不同键
-                }
+            boolean inserted = indexData.insert(entry);
+            if (inserted) {
+                IndexValuesKey valuesKey = IndexValuesKey.from(entry);
+                int oldCount = valueFrequencies.getOrDefault(valuesKey, 0);
+                valueFrequencies.put(valuesKey, oldCount + 1);
+                statistics.incrementKey(oldCount == 0);
             }
         } finally {
             indexLock.writeLock().unlock();
@@ -98,25 +122,22 @@ public class SecondaryIndex {
     public boolean delete(SecondaryIndexEntry entry) {
         indexLock.writeLock().lock();
         try {
-            List<Integer> pkList = indexData.get(entry);
-
-            if (pkList == null) {
+            boolean removed = indexData.delete(entry);
+            if (!removed) {
                 return false;
             }
 
-            boolean removed = pkList.remove(Integer.valueOf(entry.getPrimaryKey()));
-
-            if (removed) {
-                if (pkList.isEmpty()) {
-                    // 这是最后一个主键，删除整个条目
-                    indexData.remove(entry);
-                    statistics.decrementKey(true);  // 删除了一个不同的键
-                } else {
-                    statistics.decrementKey(false);  // 还有其他主键
-                }
+            IndexValuesKey valuesKey = IndexValuesKey.from(entry);
+            int oldCount = valueFrequencies.getOrDefault(valuesKey, 0);
+            if (oldCount <= 1) {
+                valueFrequencies.remove(valuesKey);
+                statistics.decrementKey(true);
+            } else {
+                valueFrequencies.put(valuesKey, oldCount - 1);
+                statistics.decrementKey(false);
             }
 
-            return removed;
+            return true;
         } finally {
             indexLock.writeLock().unlock();
         }
@@ -129,19 +150,14 @@ public class SecondaryIndex {
     public List<SecondaryIndexEntry> search(Comparable<?> value) {
         indexLock.readLock().lock();
         try {
-            List<SecondaryIndexEntry> results = new ArrayList<>();
             SecondaryIndexEntry lowerBound = new SecondaryIndexEntry(value, Integer.MIN_VALUE);
             SecondaryIndexEntry upperBound = new SecondaryIndexEntry(value, Integer.MAX_VALUE);
-
-            for (Map.Entry<SecondaryIndexEntry, List<Integer>> entry :
-                    indexData.subMap(lowerBound, true, upperBound, true).entrySet()) {
-                SecondaryIndexEntry indexEntry = entry.getKey();
-                List<Comparable<?>> indexValues = indexEntry.getIndexValues();
-                if (indexValues.isEmpty() || !Objects.equals(indexValues.get(0), value)) {
-                    continue;
-                }
-                for (Integer pk : entry.getValue()) {
-                    results.add(new SecondaryIndexEntry(indexValues, pk));
+            List<SecondaryIndexEntry> range = indexData.rangeSearch(lowerBound, true, upperBound, true);
+            List<SecondaryIndexEntry> results = new ArrayList<>();
+            for (SecondaryIndexEntry entry : range) {
+                List<Comparable<?>> indexValues = entry.getIndexValues();
+                if (!indexValues.isEmpty() && Objects.equals(indexValues.get(0), value)) {
+                    results.add(copyEntry(entry));
                 }
             }
             return results;
@@ -156,15 +172,8 @@ public class SecondaryIndex {
     public List<SecondaryIndexEntry> searchGreaterThan(Comparable<?> value) {
         indexLock.readLock().lock();
         try {
-            List<SecondaryIndexEntry> results = new ArrayList<>();
-            SecondaryIndexEntry searchKey = new SecondaryIndexEntry(value, Integer.MAX_VALUE);
-
-            for (Map.Entry<SecondaryIndexEntry, List<Integer>> entry : indexData.tailMap(searchKey, false).entrySet()) {
-                for (Integer pk : entry.getValue()) {
-                    results.add(new SecondaryIndexEntry(entry.getKey().getIndexValues(), pk));
-                }
-            }
-            return results;
+            SecondaryIndexEntry lowerBound = new SecondaryIndexEntry(value, Integer.MAX_VALUE);
+            return copyEntries(indexData.rangeSearch(lowerBound, false, null, false));
         } finally {
             indexLock.readLock().unlock();
         }
@@ -176,15 +185,8 @@ public class SecondaryIndex {
     public List<SecondaryIndexEntry> searchGreaterThanOrEqual(Comparable<?> value) {
         indexLock.readLock().lock();
         try {
-            List<SecondaryIndexEntry> results = new ArrayList<>();
             SecondaryIndexEntry lowerBound = new SecondaryIndexEntry(value, Integer.MIN_VALUE);
-
-            for (Map.Entry<SecondaryIndexEntry, List<Integer>> entry : indexData.tailMap(lowerBound, true).entrySet()) {
-                for (Integer pk : entry.getValue()) {
-                    results.add(new SecondaryIndexEntry(entry.getKey().getIndexValues(), pk));
-                }
-            }
-            return results;
+            return copyEntries(indexData.rangeSearch(lowerBound, true, null, false));
         } finally {
             indexLock.readLock().unlock();
         }
@@ -196,15 +198,8 @@ public class SecondaryIndex {
     public List<SecondaryIndexEntry> searchLessThan(Comparable<?> value) {
         indexLock.readLock().lock();
         try {
-            List<SecondaryIndexEntry> results = new ArrayList<>();
             SecondaryIndexEntry upperBound = new SecondaryIndexEntry(value, Integer.MIN_VALUE);
-
-            for (Map.Entry<SecondaryIndexEntry, List<Integer>> entry : indexData.headMap(upperBound, false).entrySet()) {
-                for (Integer pk : entry.getValue()) {
-                    results.add(new SecondaryIndexEntry(entry.getKey().getIndexValues(), pk));
-                }
-            }
-            return results;
+            return copyEntries(indexData.rangeSearch(null, false, upperBound, false));
         } finally {
             indexLock.readLock().unlock();
         }
@@ -216,15 +211,8 @@ public class SecondaryIndex {
     public List<SecondaryIndexEntry> searchLessThanOrEqual(Comparable<?> value) {
         indexLock.readLock().lock();
         try {
-            List<SecondaryIndexEntry> results = new ArrayList<>();
             SecondaryIndexEntry upperBound = new SecondaryIndexEntry(value, Integer.MAX_VALUE);
-
-            for (Map.Entry<SecondaryIndexEntry, List<Integer>> entry : indexData.headMap(upperBound, true).entrySet()) {
-                for (Integer pk : entry.getValue()) {
-                    results.add(new SecondaryIndexEntry(entry.getKey().getIndexValues(), pk));
-                }
-            }
-            return results;
+            return copyEntries(indexData.rangeSearch(null, false, upperBound, true));
         } finally {
             indexLock.readLock().unlock();
         }
@@ -292,6 +280,18 @@ public class SecondaryIndex {
         } finally {
             indexLock.readLock().unlock();
         }
+    }
+
+    private List<SecondaryIndexEntry> copyEntries(List<SecondaryIndexEntry> source) {
+        List<SecondaryIndexEntry> result = new ArrayList<>(source.size());
+        for (SecondaryIndexEntry entry : source) {
+            result.add(copyEntry(entry));
+        }
+        return result;
+    }
+
+    private SecondaryIndexEntry copyEntry(SecondaryIndexEntry entry) {
+        return new SecondaryIndexEntry(entry.getIndexValues(), entry.getPrimaryKey());
     }
 
     @Override

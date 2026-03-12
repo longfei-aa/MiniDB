@@ -77,10 +77,6 @@ public class Executor implements RecoveryApplier, UndoApplier {
     private final String tableRootsFilePath;
     private final Map<String, Integer> tableIds;
     private int nextTableId;
-    private long commitsSinceLastCheckpoint;
-
-    private static final long CHECKPOINT_COMMIT_INTERVAL = 32;
-    private static final long CHECKPOINT_LSN_INTERVAL = 256;
 
     private Session getSessionContext(String sessionId) {
         String normalized = (sessionId == null || sessionId.isEmpty()) ? DEFAULT_SESSION_ID : sessionId;
@@ -124,7 +120,6 @@ public class Executor implements RecoveryApplier, UndoApplier {
         this.tableRootsFilePath = metadataDirPath + "/table_roots.meta";
         this.tableIds = new HashMap<>();
         this.nextTableId = 1;
-        this.commitsSinceLastCheckpoint = 0;
 
         try {
             loadSchemaFromDisk();
@@ -454,9 +449,11 @@ public class Executor implements RecoveryApplier, UndoApplier {
             // 自动提交模式：立即提交
             if (autoCommit) {
                 redoLog.writeCommitLog(txn.getTransactionId());
-                bufferPool.flushAllPages();
+                boolean flushedDirtyPages = bufferPool.flushAllPages();
                 transactionManager.commit(txn);
-                maybeCreateCheckpoint();
+                if (flushedDirtyPages) {
+                    createCheckpoint();
+                }
                 tryPurgeDeletedRows();
                 purgeUndoHistory();
                 lockManager.releaseAllLocks(txn);
@@ -843,9 +840,11 @@ public class Executor implements RecoveryApplier, UndoApplier {
             // 自动提交模式：立即提交
             if (autoCommit) {
                 redoLog.writeCommitLog(txn.getTransactionId());
-                bufferPool.flushAllPages();
+                boolean flushedDirtyPages = bufferPool.flushAllPages();
                 transactionManager.commit(txn);
-                maybeCreateCheckpoint();
+                if (flushedDirtyPages) {
+                    createCheckpoint();
+                }
                 tryPurgeDeletedRows();
                 purgeUndoHistory();
                 lockManager.releaseAllLocks(txn);
@@ -999,9 +998,11 @@ public class Executor implements RecoveryApplier, UndoApplier {
             // 自动提交模式：立即提交
             if (autoCommit) {
                 redoLog.writeCommitLog(txn.getTransactionId());
-                bufferPool.flushAllPages();
+                boolean flushedDirtyPages = bufferPool.flushAllPages();
                 transactionManager.commit(txn);
-                maybeCreateCheckpoint();
+                if (flushedDirtyPages) {
+                    createCheckpoint();
+                }
                 tryPurgeDeletedRows();
                 purgeUndoHistory();
                 lockManager.releaseAllLocks(txn);
@@ -1064,14 +1065,16 @@ public class Executor implements RecoveryApplier, UndoApplier {
             redoLog.writeCommitLog(txnId);
 
             // 刷新所有脏页到磁盘
-            bufferPool.flushAllPages();
+            boolean flushedDirtyPages = bufferPool.flushAllPages();
 
             // MVCC: 提交事务（清理 ReadView）
             mvccManager.commit(txn);
 
             // 提交事务
             transactionManager.commit(txn);
-            maybeCreateCheckpoint();
+            if (flushedDirtyPages) {
+                createCheckpoint();
+            }
 
             // 延迟清理逻辑删除记录
             tryPurgeDeletedRows();
@@ -1248,17 +1251,6 @@ public class Executor implements RecoveryApplier, UndoApplier {
             new HashSet<>(snapshot.getActiveTransactionIds()),
             Collections.emptySet()
         );
-        commitsSinceLastCheckpoint = 0;
-    }
-
-    private void maybeCreateCheckpoint() {
-        commitsSinceLastCheckpoint++;
-        long lsnGap = Math.max(0L, redoLog.getFlushedLsn() - redoLog.getCheckpointLsn());
-        if (commitsSinceLastCheckpoint < CHECKPOINT_COMMIT_INTERVAL
-            && lsnGap < CHECKPOINT_LSN_INTERVAL) {
-            return;
-        }
-        createCheckpoint();
     }
 
     /**
@@ -1889,8 +1881,9 @@ public class Executor implements RecoveryApplier, UndoApplier {
                     executeRollbackInternal(session, session.getCurrentTransaction().getTransactionId(), "Executor shutdown");
                 }
             }
-            bufferPool.flushAllPages();
-            createCheckpoint();
+            if (bufferPool.flushAllPages()) {
+                createCheckpoint();
+            }
         } catch (Exception e) {
             throw new IOException("Failed to close executor cleanly", e);
         } finally {

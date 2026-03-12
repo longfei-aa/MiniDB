@@ -164,8 +164,11 @@ public class BufferPool {
 
     /**
      * 刷新所有脏页到磁盘
+     *
+     * @return 本次调用是否至少刷出了一个脏页
      */
-    public void flushAllPages() throws IOException {
+    public boolean flushAllPages() throws IOException {
+        boolean flushedDirtyPages = false;
         poolLock.readLock().lock();
         try {
             for (Map.Entry<Integer, Page> entry : pageCache.entrySet()) {
@@ -173,11 +176,13 @@ public class BufferPool {
                 if (page.isDirty()) {
                     diskManager.writePage(entry.getKey(), page);
                     page.markClean();
+                    flushedDirtyPages = true;
                 }
             }
         } finally {
             poolLock.readLock().unlock();
         }
+        return flushedDirtyPages;
     }
 
     /**

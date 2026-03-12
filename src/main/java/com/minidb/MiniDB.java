@@ -16,15 +16,23 @@ public class MiniDB {
     private final BufferPool bufferPool;
     private final Executor executor;
     private final String dbName;
+    private final boolean verbose;
 
     public MiniDB(String dbName) throws IOException {
+        this(dbName, true);
+    }
+
+    public MiniDB(String dbName, boolean verbose) throws IOException {
         this.dbName = dbName;
+        this.verbose = verbose;
         this.diskManager = new DiskManager(dbName);
         this.bufferPool = new BufferPool(diskManager);
         this.executor = new Executor(bufferPool, dbName);
 
-        System.out.println("MiniDB initialized: " + dbName);
-        System.out.println("Data file: " + diskManager.getDataFilePath());
+        if (this.verbose) {
+            System.out.println("MiniDB initialized: " + dbName);
+            System.out.println("Data file: " + diskManager.getDataFilePath());
+        }
     }
 
     /**
@@ -39,18 +47,24 @@ public class MiniDB {
      */
     public ExecutionResult executeSQL(String sessionId, String sql) {
         try {
-            System.out.println("\n[SQL] " + sql);
+            if (verbose) {
+                System.out.println("\n[SQL] " + sql);
+            }
 
             Parser parser = new Parser(sql);
             Statement statement = parser.parse();
 
             ExecutionResult result = executor.execute(sessionId, statement);
-            System.out.println("[Result] " + result);
+            if (verbose) {
+                System.out.println("[Result] " + result);
+            }
 
             return result;
         } catch (Exception e) {
             String errorMsg = "Error executing SQL: " + e.getMessage();
-            System.out.println("[Error] " + errorMsg);
+            if (verbose) {
+                System.out.println("[Error] " + errorMsg);
+            }
             return new ExecutionResult(false, errorMsg);
         }
     }
@@ -70,11 +84,15 @@ public class MiniDB {
      * 关闭数据库
      */
     public void close() throws IOException {
-        System.out.println("\nClosing MiniDB...");
+        if (verbose) {
+            System.out.println("\nClosing MiniDB...");
+        }
         executor.close();
         bufferPool.shutdown();
         diskManager.close();
-        System.out.println("MiniDB closed successfully");
+        if (verbose) {
+            System.out.println("MiniDB closed successfully");
+        }
     }
 
     public static void main(String[] args) {
